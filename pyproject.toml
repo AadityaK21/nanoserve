@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# Without this, `pytest` run from the repo root inserts tests/ on sys.path but
+# not the root itself, so `import nanoserve` fails. Only `python -m pytest`
+# happens to work, which is a confusing difference to debug.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

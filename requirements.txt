@@ -1,0 +1,10 @@
+torch>=2.4.0
+transformers>=4.44.0
+accelerate>=0.33.0
+numpy>=1.26.0
+matplotlib>=3.8.0
+pytest>=8.0.0
+
+# Triton is Linux/WSL2 only and optional. The engine falls back to the torch
+# attention backend when it is missing.
+# triton>=3.0.0 ; sys_platform == "linux"

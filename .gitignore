@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Model weights and HF cache -- never commit these, they are GBs
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+hf_cache/
+models/
+.cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+nsys-rep/
+*.nsys-rep
+*.sqlite
+
+# NOTE: results/*.json and results/*.png are committed on purpose.
+# The benchmark numbers are the deliverable.
