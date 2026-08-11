@@ -88,7 +88,10 @@ def plot_chunked(r):
     d = r.get("chunked_prefill")
     if not _ok(d):
         return
-    keys = list(d)
+    # Rejected configs (nochunk with an oversized prompt) carry no latencies.
+    keys = [k for k in d if isinstance(d[k], dict) and "ttft_p99_ms" in d[k]]
+    if not keys:
+        return
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
     for ax, metric, label in zip(axes, ("ttft_p99_ms", "tpot_p99_ms"),
                                  ("p99 TTFT (ms)", "p99 TPOT (ms)")):

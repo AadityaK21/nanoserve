@@ -200,6 +200,28 @@ class LLMEngine:
         outs = self.run_all(detokenize=True)
         return sorted(outs, key=lambda o: o.request_id)
 
+    def shutdown(self) -> None:
+        """Release the KV cache and weights.
+
+        A sweep builds many engines with different configurations, and the KV
+        cache is deliberately sized to eat most of free VRAM -- 4.8 GiB here.
+        Letting Python drop the reference is not enough: the caching allocator
+        holds the blocks, so the next engine's profiler sees a nearly full GPU
+        and refuses to start. Every engine in a multi-engine script has to be
+        explicitly torn down.
+        """
+        import gc
+
+        self.scheduler = None
+        self.runner = None
+        self.kv_cache = None
+        self.block_manager = None
+        self.model = None
+        gc.collect()
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
     def reset(self) -> None:
         """Clear state between sweep points without reloading the weights."""
         for s in list(self.scheduler.running) + list(self.scheduler.waiting):

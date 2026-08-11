@@ -54,16 +54,46 @@ class AttentionMetadata:
     query_start_loc_cpu: list[int] = None     # type: ignore[assignment]
 
 
+def _detect_gqa_support() -> bool:
+    """Does this torch's SDPA broadcast KV heads for us?
+
+    torch >= 2.5 takes enable_gqa and handles the 1-to-many head mapping inside
+    the kernel. Without it we have to materialise an expanded copy of K and V,
+    which for Qwen2.5-0.5B means writing out 7x more KV than we read. Detect by
+    calling it rather than by version number, because the flag has moved
+    between releases.
+    """
+    try:
+        q = torch.zeros(1, 2, 1, 8)
+        kv = torch.zeros(1, 1, 1, 8)
+        F.scaled_dot_product_attention(q, kv, kv, enable_gqa=True)
+        return True
+    except Exception:
+        return False
+
+
+_HAS_GQA = _detect_gqa_support()
+
+
 def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """[*, H_kv, L, D] -> [*, H_kv * n_rep, L, D] for grouped-query attention.
 
     Qwen2.5-0.5B has 14 query heads and 2 KV heads, so each KV head is shared
     by 7 query heads. That 7x reduction in KV heads is why the cache is small
-    enough to serve dozens of concurrent sequences on 8 GB.
+    enough to serve dozens of concurrent sequences on 8 GB -- and why
+    materialising the expansion, when SDPA could do it internally, is such a
+    waste of bandwidth.
     """
-    if n_rep == 1:
+    if n_rep == 1 or _HAS_GQA:
         return x
     return x.repeat_interleave(n_rep, dim=-3)
+
+
+def _sdpa(q, k, v, attn_mask, scale, n_rep):
+    kwargs = {"attn_mask": attn_mask, "scale": scale}
+    if _HAS_GQA and n_rep > 1:
+        kwargs["enable_gqa"] = True
+    return F.scaled_dot_product_attention(q, k, v, **kwargs)
 
 
 @torch.inference_mode()
@@ -113,12 +143,9 @@ def paged_attention_torch(
         k_pos = torch.arange(sl, device=query.device)
         mask = k_pos[None, :] <= q_pos[:, None]                # [ql, sl] True = attend
 
-        o = F.scaled_dot_product_attention(
-            q_i.unsqueeze(0),
-            k_i.unsqueeze(0),
-            v_i.unsqueeze(0),
-            attn_mask=mask[None, None, :, :],
-            scale=scale,
+        o = _sdpa(
+            q_i.unsqueeze(0), k_i.unsqueeze(0), v_i.unsqueeze(0),
+            mask[None, None, :, :], scale, n_rep,
         )
         out[s:e] = o.squeeze(0).transpose(0, 1)
     return out
@@ -159,9 +186,7 @@ def _decode_batched(query, kf, vf, md, scale, n_rep, block_size):
     seq_lens = md.seq_lens.to(device=device, dtype=torch.long)
     valid = torch.arange(ctx, device=device)[None, :] < seq_lens[:, None]  # [S, ctx]
 
-    o = F.scaled_dot_product_attention(
-        q, k, v, attn_mask=valid[:, None, None, :], scale=scale
-    )
+    o = _sdpa(q, k, v, valid[:, None, None, :], scale, n_rep)
     return o.permute(0, 2, 1, 3).reshape(S * 1, num_heads, head_dim)
 
 

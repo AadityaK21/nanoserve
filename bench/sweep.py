@@ -96,8 +96,20 @@ def main() -> None:
     batch_sizes = [1, 4, 16] if args.quick else [1, 2, 4, 8, 16, 32, 64]
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
 
-    results: dict = {"meta": {"device": args.device, "dtype": args.dtype, "n": n,
-                              "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}}
+    # Merge into an existing sweep.json rather than clobbering it, so --skip
+    # keeps previous results. Re-running a 30-minute static baseline to fix one
+    # failed experiment is not a reasonable workflow.
+    results: dict = {}
+    prior = RESULTS / "sweep.json"
+    if prior.exists():
+        try:
+            results = json.loads(prior.read_text())
+            print(f"-- merging into existing {prior} "
+                  f"({', '.join(k for k in results if k != 'meta')})")
+        except Exception:
+            results = {}
+    results["meta"] = {"device": args.device, "dtype": args.dtype, "n": n,
+                       "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
     if torch.cuda.is_available():
         results["meta"]["gpu"] = torch.cuda.get_device_name(0)
 
@@ -159,17 +171,25 @@ def main() -> None:
         long_reqs = skewed_workload(n, tok, prompt_mean=768, prompt_sigma=0.8,
                                     output_mean=128, request_rate=8, seed=1)
         for chunked in (True, False):
-            for budget in ([512, 2048] if not args.quick else [512]):
+            for budget in ([512, 2048] if not args.quick else [512, 2048]):
+                key = f"{'chunked' if chunked else 'nochunk'}_budget{budget}"
                 e = make_engine(args.device, args.dtype, chunked=chunked, max_batched=budget)
                 try:
                     s = drive(e, long_reqs, request_rate=8)
-                    key = f"{'chunked' if chunked else 'nochunk'}_budget{budget}"
                     print_summary(key, s)
                     out[key] = s
+                except ValueError as ve:
+                    # Not a bug -- it is the ablation's result. Without chunked
+                    # prefill, any prompt longer than the whole token budget can
+                    # never be scheduled, so the engine rejects it loudly. That
+                    # *is* the argument for chunking; record it as such.
+                    print(f"  {key}: rejected as expected -- {ve}")
+                    out[key] = {"rejected": str(ve),
+                                "meaning": "prompts longer than the budget are "
+                                           "unschedulable without chunked prefill"}
                 finally:
+                    e.shutdown()
                     del e
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
         return out
 
     def exp_block_size():
@@ -184,9 +204,8 @@ def main() -> None:
                 print_summary(f"block_size={bs_blk}", s)
                 out[f"block{bs_blk}"] = s
             finally:
+                e.shutdown()
                 del e
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
         return out
 
     def exp_quantization():
@@ -203,9 +222,8 @@ def main() -> None:
                       f"KV capacity {info['kv_capacity_tokens']:,} tok")
                 out[str(q)] = s
             finally:
+                e.shutdown()
                 del e
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
         return out
 
     def exp_backend():
@@ -222,21 +240,41 @@ def main() -> None:
                 print_summary(f"backend={backend}", s)
                 out[backend] = s
             finally:
+                e.shutdown()
                 del e
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
         return out
 
-    experiments = {
-        "static_baseline": exp_static_baseline,
+    # Ordering is a memory constraint, not a preference. The shared engine holds
+    # ~4.8 GiB of KV cache, so everything that reuses it has to run before it is
+    # torn down, and everything that builds its own engine has to run after.
+    shared = {
         "continuous": exp_continuous,
         "latency_vs_load": exp_latency_vs_load,
+    }
+    standalone = {
+        "static_baseline": exp_static_baseline,
         "chunked_prefill": exp_chunked_prefill,
         "block_size": exp_block_size,
         "quantization": exp_quantization,
         "backend": exp_backend,
     }
-    for name, fn in experiments.items():
+
+    for name, fn in shared.items():
+        if name in skip:
+            print(f"-- skipping {name}")
+            continue
+        guard(name, fn, results)
+
+    # Rebind rather than `del`: the closures above capture this name, and
+    # deleting it turns them into a NameError waiting to happen.
+    engine.shutdown()
+    engine = None
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        print(f"\n-- released shared engine: {free / 2**20:.0f} MiB free of "
+              f"{total / 2**20:.0f} MiB")
+
+    for name, fn in standalone.items():
         if name in skip:
             print(f"-- skipping {name}")
             continue

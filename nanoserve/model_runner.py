@@ -37,6 +37,50 @@ class ModelRunner:
         self.block_size = kv_cache.block_size if kv_cache is not None else block_size
         self.dtype = dtype or (kv_cache.dtype if kv_cache is not None else torch.float16)
 
+        # Staging buffers for per-step metadata. Every step needs six integer
+        # vectors on the GPU (tokens, positions, slots, offsets, lengths, block
+        # tables). Sending them as six separate torch.tensor(list, device=cuda)
+        # calls means six host allocations and six PCIe transfers per step. On
+        # Windows/WDDM, where each submission goes through the OS scheduler,
+        # that was measured at ~6 ms per step -- more than the GPU spends on the
+        # entire forward pass. Packing them into one pinned buffer makes it one.
+        self._pin = torch.cuda.is_available() and str(device).startswith("cuda")
+        self._host: torch.Tensor | None = None
+        self._devbuf: torch.Tensor | None = None
+
+    # ---- staging ---------------------------------------------------------
+    def _stage(self, chunks: list[list[int]]) -> list[torch.Tensor]:
+        """Concatenate int vectors, ship them in one transfer, hand back views.
+
+        The copy is deliberately blocking. A non-blocking copy out of the pinned
+        buffer would let the next step overwrite it while the DMA is still in
+        flight, which corrupts the metadata of the step already running -- a
+        race that would show up as occasional wrong tokens rather than a crash.
+        Double-buffering the host side would allow async; one transfer instead
+        of six is already most of the win.
+        """
+        sizes = [len(c) for c in chunks]
+        total = sum(sizes)
+        if total == 0:
+            return [torch.empty(0, dtype=torch.long, device=self.device) for _ in chunks]
+
+        if self._host is None or self._host.numel() < total:
+            n = max(total * 2, 8192)
+            self._host = torch.empty(n, dtype=torch.long, pin_memory=self._pin)
+            self._devbuf = torch.empty(n, dtype=torch.long, device=self.device)
+
+        flat: list[int] = []
+        for c in chunks:
+            flat.extend(c)
+        self._host[:total].copy_(torch.tensor(flat, dtype=torch.long))
+        self._devbuf[:total].copy_(self._host[:total])
+
+        views, off = [], 0
+        for n in sizes:
+            views.append(self._devbuf[off:off + n])
+            off += n
+        return views
+
     # ---- metadata construction -----------------------------------------
     def build_inputs(self, scheduled):
         """scheduled: list of (Sequence, num_tokens_to_compute).
@@ -74,17 +118,23 @@ class ModelRunner:
 
         max_seq_len = max(seq_lens)
         max_blocks = (max_seq_len + self.block_size - 1) // self.block_size
-        bt = torch.zeros((len(scheduled), max_blocks), dtype=torch.int32)
-        for i, (seq, _) in enumerate(scheduled):
-            n = min(len(seq.block_table), max_blocks)
-            bt[i, :n] = torch.tensor(seq.block_table[:n], dtype=torch.int32)
+        bt_flat: list[int] = []
+        for seq, _ in scheduled:
+            row = seq.block_table[:max_blocks]
+            bt_flat.extend(row)
+            bt_flat.extend([0] * (max_blocks - len(row)))
 
-        dev = self.device
+        # One pinned transfer for all six vectors, then slice on the device.
+        ids_t, pos_t, slot_t, qsl_t, sl_t, bt_t, samp_t = self._stage(
+            [input_ids, positions, slot_mapping, query_start_loc, seq_lens,
+             bt_flat, sample_indices]
+        )
+
         md = AttentionMetadata(
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.long, device=dev),
-            query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32, device=dev),
-            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=dev),
-            block_tables=bt.to(dev),
+            slot_mapping=slot_t,
+            query_start_loc=qsl_t,
+            seq_lens=sl_t,
+            block_tables=bt_t.view(len(scheduled), max_blocks),
             max_query_len=max(query_lens),
             max_seq_len=max_seq_len,
             num_seqs=len(scheduled),
@@ -95,13 +145,7 @@ class ModelRunner:
             query_start_loc_cpu=query_start_loc,
         )
 
-        return (
-            torch.tensor(input_ids, dtype=torch.long, device=dev),
-            torch.tensor(positions, dtype=torch.long, device=dev),
-            md,
-            torch.tensor(sample_indices, dtype=torch.long, device=dev) if sample_indices else None,
-            sample_seqs,
-        )
+        return ids_t, pos_t, md, (samp_t if sample_indices else None), sample_seqs
 
     # ---- execution -------------------------------------------------------
     @torch.inference_mode()

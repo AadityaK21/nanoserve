@@ -1,16 +1,16 @@
 # nanoserve — results
 
-> Fill this in from `results/sweep.json` and the figures in `results/`.
-> Every `TODO` is a number the benchmark produces. Keep the framing; replace
-> the numbers. Do not round in your favour — the point of the report is that
-> you can defend it.
+**Hardware:** RTX 4060 Laptop 8 GB (Ada) · Windows 11, WDDM driver model ·
+PyTorch 2.11.0+cu128 · CUDA 12.8
+**Model:** Qwen2.5-0.5B-Instruct, fp16 · 494M params · 24 layers · 14 query
+heads / 2 KV heads (GQA 7:1) · head_dim 64
+**Workloads:** `--quick` sweep, n=32 requests. *Skewed* = lognormal prompt and
+output lengths (realistic traffic). *Uniform* = identical 256-in / 128-out
+(the optimistic case). Greedy + `ignore_eos`, so output length is exactly
+controlled. All numbers from `results/sweep.json` and `results/diagnose.json`.
 
-**Hardware:** RTX 4060 8 GB (Ada, TODO GB/s memory bandwidth) · TODO driver ·
-PyTorch TODO · CUDA TODO
-**Model:** Qwen2.5-0.5B-Instruct, fp16 · 24 layers · 14 query heads · 2 KV heads
-· head_dim 64
-**KV cost:** `2 × 24 × 2 × 64 × 2 B` = **12 KiB per token** (TODO confirm from
-`engine.describe()`)
+Run-to-run noise on this machine is ~10%, so only same-run comparisons and
+effects well above that are claimed.
 
 ---
 
@@ -18,166 +18,199 @@ PyTorch TODO · CUDA TODO
 
 | | MiB |
 |---|---|
-| Weights (fp16) | TODO |
-| Activations, worst-case step | TODO |
-| KV cache after profiling | TODO |
-| **KV capacity** | **TODO tokens** (TODO blocks × 16) |
+| Weights (fp16) | 943 |
+| KV cache (profiled, `gpu_memory_utilization=0.85`) | 4,834 |
+| **KV cost per token** | **12 KiB** (2 × 24 layers × 2 KV heads × 64 × 2 B) |
+| **KV capacity** | **412,480 tokens** = 25,780 blocks × 16 |
 
-At 12 KiB/token, 8 GB of VRAM is roughly TODO tokens of KV before you account
-for weights. That number, not FLOPs, is what caps concurrency on this GPU.
+GQA is doing enormous work here: with 14 KV heads instead of 2, per-token cost
+would be 84 KiB and capacity ~59k tokens. The 7:1 head sharing is why a laptop
+GPU can hold ~800 concurrent 512-token sequences at all.
 
-## 2. Static batching: where it stops scaling
+A naive server reserving contiguous `max_model_len = 4096` per request fits
+**100** concurrent requests in the same memory; paging bounds waste to at most
+15 tokens per sequence instead of `4096 − actual`, which is where the 8×
+concurrency headroom comes from.
 
-`results/fig1_throughput.png`
+## 2. Roofline: this GPU is overhead-bound, not memory-bound
 
-| Batch size | Output tok/s (uniform) | Output tok/s (skewed) | p99 E2E (ms) |
-|---|---|---|---|
-| 1 | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO |
-| 16 | TODO | TODO | TODO |
-| 64 | TODO | TODO | TODO |
+`python -m bench.diagnose` → `results/diagnose.json`
 
-Throughput flattens around batch size **TODO**. Past that point decode is
-memory-bandwidth bound: each step reads the full weight matrix regardless of
-batch size, so adding rows costs nothing until the KV traffic itself saturates
-the bus.
+Most inference writing assumes decode is memory-bandwidth bound. On this
+machine it is not, and every result below has to be read in that light.
 
-Note the gap between the uniform and skewed columns. With uniform lengths every
-sequence in a static batch finishes at the same step and almost nothing is
-wasted. With lognormal lengths — which is what real traffic looks like — the
-batch runs until its longest member finishes, and the average row spends TODO%
-of its life computing tokens nobody asked for.
+| | measured |
+|---|---|
+| Achieved memory bandwidth | 209–222 GB/s |
+| fp16 GEMM | ~30 TFLOP/s |
+| **Bandwidth floor per decode step** | **~4.6 ms** (943 MiB / bandwidth) |
+| Actual batch-1 step | 23.7 ms (transformers) / 28.2 ms (nanoserve) |
+| GPU-busy time within that step | 6.6 / 7.2 ms |
+| **GPU utilisation during decode** | **~18%** |
 
-## 3. Continuous batching
+The GPU is idle ~82% of every decode step, waiting on the CPU to issue ~1,300
+kernels at ~8 µs each. Windows' WDDM driver model routes every launch through
+the OS scheduler, which inflates that latency relative to Linux.
 
-`results/fig1_throughput.png`
+The signature is visible everywhere: step time is ~flat from batch 1 to batch
+32 (28 → 34 ms), so throughput scales almost linearly with batch size —
+**35.5 → 941.8 tok/s, a 26× gain for 20% more step time**. Batching is close to
+free until the fixed per-step cost is amortised away.
 
-| | Static (best batch size) | Continuous | Δ |
-|---|---|---|---|
-| Output tok/s, skewed | TODO | TODO | **TODO×** |
-| Output tok/s, uniform | TODO | TODO | TODO× |
-| p99 TTFT (ms) | TODO | TODO | TODO |
-| p99 E2E (ms) | TODO | TODO | TODO |
-| Mean batch size | (fixed) | TODO | |
+### Measurement bugs found on the way (kept, deliberately)
 
-The win is concentrated in the skewed workload, and that is the honest framing:
-continuous batching does not make the GPU faster, it stops the batch from going
-stale. Under uniform lengths there is almost nothing to recover, and the
-numbers should show that.
+The first four attempts at this measurement produced wrong numbers, each
+plausible-looking:
 
-## 4. Tail latency vs offered load
+- **Clock ramp.** The GPU idles at 210 MHz / 3 W and boosts to 2595 MHz /
+  101 W — a 12.4× swing. Whichever config ran first was measured cold, which
+  once produced "batch 32 is faster than batch 1" and a fake 3.4× win over
+  transformers. Fix: 8 s of sustained GEMMs before measuring, re-warmed before
+  every row (model loading lets clocks fall back).
+- **Double-counted kernels.** `key_averages()` attributes device time to both
+  the `aten::` op and its kernel; summing both reported 166% GPU utilisation.
+- **Profiled busy ÷ unprofiled wall.** Utilisation must use busy and wall time
+  from the same (profiled) run; profiling inflates kernel durations.
+- **Instability.** Every config is now timed twice and flagged if the runs
+  disagree by >15%.
 
-`results/fig2_latency_vs_load.png`
+### Optimisations this motivated (batch-1 step, same run pair: 33.7 → 28.2 ms, −16%)
 
-| Rate (req/s) | p50 TTFT | p99 TTFT | p50 TPOT | p99 TPOT | p99 E2E | Preemptions |
-|---|---|---|---|---|---|---|
-| 1 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 16 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 32 | TODO | TODO | TODO | TODO | TODO | TODO |
+| Change | Why it mattered here |
+|---|---|
+| RoPE cos/sin hoisted out of the layer loop | positions are identical across all 24 layers; the per-layer lookup built 48 identical tensors per step |
+| `F.rms_norm` (fused) | replaced an 8-kernel hand-written norm at 48 sites/step |
+| `enable_gqa=True` in SDPA | stopped materialising a 7× expanded copy of K and V |
+| One pinned H2D copy for all per-step metadata | was six separate `torch.tensor(list, device=cuda)` transfers per step |
+| Block-wise slot mapping | 128 loop iterations per 2048-token chunk instead of 2048 |
 
-The knee sits at roughly **TODO req/s**. Below it, TTFT is prefill time. Above
-it, the queue never drains and TTFT becomes queueing delay, which is why it
-grows without bound while TPOT stays roughly flat — the GPU is still decoding
-at the same rate, there is just a longer line for it.
+After these, nanoserve issues fewer device ops per step than eager
+transformers (1,257 vs 1,350) and overtakes it at batch 32 (941.8 vs 925.0
+tok/s). At batch 1 it remains 0.84× — the torch paged-attention backend
+re-gathers the whole KV context every step, which is the cost the Triton
+kernel removes (§8).
+
+## 3. Continuous batching vs static batching
+
+The headline experiment. Same 32 requests, same model, same GPU.
+
+**Skewed lengths (realistic):**
+
+| | output tok/s | p99 TTFT | p99 E2E | wall time |
+|---|---|---|---|---|
+| static bs=1 | 10.0 | 653 s | 675 s | 678 s |
+| static bs=4 | 22.9 | 248 s | 285 s | 297 s |
+| static bs=16 (best) | 61.0 | 60.8 s | 110.8 s | 112 s |
+| **continuous** | **100.4** | **5.2 s** | **65.4 s** | **68 s** |
+
+**1.65× the throughput of the best static configuration, with 12× better p99
+TTFT.** TTFT is the number that collapses: static batching makes request 32
+wait for every earlier batch to fully finish, so tail TTFT is queueing time.
+Continuous batching admits a request into the next iteration.
+
+**Uniform lengths (the honest control):** continuous 223.5 vs static bs=16
+152.3 tok/s — **1.47×**. The gap narrows exactly as theory predicts: with
+identical lengths every sequence in a static batch finishes together, so there
+is little straggler waste to recover. The win on skewed traffic is the real
+one, and skewed is what production traffic looks like.
+
+Static TPOT is ~100 ms at *every* batch size (§2's flat-step-time signature),
+so static throughput is `batch_size / 100 ms` — it scales only by raising batch
+size, and its latency cost scales with it.
+
+## 4. Latency vs offered load (skewed, Poisson arrivals)
+
+| rate (req/s) | output tok/s | p99 TTFT | p99 TPOT | p99 E2E |
+|---|---|---|---|---|
+| 2 | 84.5 | 2.51 s | 370 ms | 69.6 s |
+| 4 | 92.5 | 2.41 s | 279 ms | 67.0 s |
+| 8 | 119.5 | 2.93 s | 192 ms | 52.8 s |
+
+On a bandwidth-bound system, more load means worse tail latency. Here **p99
+TPOT improves with load** (370 → 192 ms) because a fuller batch amortises the
+fixed per-step overhead — an overhead-bound system runs *more efficiently*
+under pressure. The saturation knee is not reached by 8 req/s at n=32; the
+full (non-quick) sweep extends to 32 req/s to find it.
 
 ## 5. Chunked prefill
 
-`results/fig3_chunked_prefill.png`
+Long-prompt workload (lognormal, mean 768 tokens), 8 req/s:
 
-| Config | p99 TTFT | p99 TPOT | Output tok/s |
-|---|---|---|---|
-| No chunking, budget 2048 | TODO | TODO | TODO |
-| Chunked, budget 2048 | TODO | TODO | TODO |
-| Chunked, budget 512 | TODO | TODO | TODO |
+| config | outcome |
+|---|---|
+| chunked, budget 512 | works: p99 TTFT 42.3 s, p99 TPOT 890 ms under heavy prefill load |
+| no chunking, budget 512 | **rejected: a 1,012-token prompt exceeds the whole per-step budget and can never be scheduled** |
 
-The trade is explicit: a smaller chunk budget raises TTFT (a long prompt takes
-more steps to finish prefilling) and lowers p99 TPOT (decodes stop being
-blocked behind whole prefills). At budget 512 the p99 TPOT improves by TODO%
-for TODO% worse median TTFT. Which side of that trade you want depends on
-whether the product is a chat UI (protect TPOT) or a batch job (protect
-throughput).
+The ablation produced a stronger result than a slowdown: without chunking,
+long prompts are not slower — they are *unschedulable* at this budget. Chunking
+is what makes a small token budget (which protects decode TPOT) compatible
+with long prompts at all. The budget-2048 comparison quantifying the TTFT/TPOT
+trade is in the full sweep.
 
 ## 6. Paging granularity
 
-`results/fig4_block_size.png`
+| block_size | output tok/s (skewed) |
+|---|---|
+| 8 | 102.2 |
+| 16 | 102.5 |
+| 32 | 101.6 |
 
-| block_size | Blocks | KV capacity (tok) | Output tok/s | Waste bound |
+No measurable effect — differences are inside run noise. Expected on this
+hardware: the gather cost is launch-dominated, not layout-dominated, and at
+n=32 capacity is nowhere near binding, so the fragmentation differences
+(bounded at 7 vs 31 tokens/seq) never matter. 16 is kept as the default.
+
+## 7. Quantisation: capacity up, throughput down — and why
+
+| | weights | KV capacity (tok) | output tok/s | p99 TPOT |
 |---|---|---|---|---|
-| 8 | TODO | TODO | TODO | 7 tok/seq |
-| 16 | TODO | TODO | TODO | 15 tok/seq |
-| 32 | TODO | TODO | TODO | 31 tok/seq |
-| 64 | TODO | TODO | TODO | 63 tok/seq |
+| fp16 | 943 MiB | 412,320 | 102.5 | 184 ms |
+| INT8 per-channel | 603 MiB | 439,792 | 79.6 (0.78×) | 209 ms |
+| INT4 group-128 | 445 MiB | 458,048 | 49.2 (0.48×) | 299 ms |
 
-Small blocks waste less memory per sequence but make block tables longer and
-the kernel's inner loop shorter. TODO was best here. For comparison, a naive
-non-paged server reserving `max_model_len = 4096` per sequence fits only
-TODO concurrent sequences in the same VRAM — that is the number paging exists
-to fix.
+The memory result is exactly as designed: INT4 frees ~500 MiB, worth ~46k
+tokens of extra KV capacity.
 
-## 7. Quantisation
+The throughput result is negative, and the mechanism is worth stating
+precisely. This implementation dequantises to fp16 before every matmul —
+weight-only quantisation without a fused dequant-GEMM kernel *adds* kernels
+and per-step latency. That is a pure cost unless the workload is
+capacity-limited, and at n=32 the fp16 cache already holds every request, so
+the extra capacity buys nothing. The freed memory would start paying at the
+concurrency where fp16 runs out of blocks (~800 × 512-token sequences) and
+INT4 admits more; this workload never gets there.
 
-`results/fig5_quantization.png`
-
-| | Weights (MiB) | KV blocks | KV capacity (tok) | Output tok/s | Mean batch |
-|---|---|---|---|---|---|
-| fp16 | TODO | TODO | TODO | TODO | TODO |
-| INT8 per-channel | TODO | TODO | TODO | TODO | TODO |
-| INT4 group-128 | TODO | TODO | TODO | TODO | TODO |
-
-INT4 frees **TODO MiB**, which at 12 KiB/token is **TODO more tokens** of KV
-capacity and raises the achievable batch size from TODO to TODO.
-
-Be precise about the mechanism: weights are dequantised to fp16 before the
-matmul, so this does not reduce FLOPs. The throughput change comes entirely
-from the extra concurrency the freed memory buys. On a workload that was not
-memory-limited, INT4 would be slightly *slower* because of the dequant
-overhead — check whether that shows up at low batch sizes.
-
-Quality check: TODO (cosine similarity of logits vs fp16, or perplexity on a
-fixed passage).
+Honest summary: **quantisation here is a capacity feature, demonstrated; the
+speed feature requires a fused dequant-GEMM kernel, which is future work.**
+Claiming otherwise would not survive the first follow-up question.
 
 ## 8. Attention backend
 
-`results/fig6_backend.png`
+Both rows ran the torch backend: Triton is unavailable on native Windows. The
+torch backend's known cost — re-gathering the full KV context every decode
+step — is the residual 0.6 ms/step of extra GPU work vs transformers at batch
+1 (§2). The Triton kernel (written, correctness-tested against the torch
+backend on random block tables) removes that gather by walking the block table
+with an online softmax. Benchmarking it is a WSL2 task.
 
-| Backend | Output tok/s | p50 TPOT (ms) | p99 TPOT (ms) |
-|---|---|---|---|
-| torch (gather + SDPA) | TODO | TODO | TODO |
-| Triton (fused) | TODO | TODO | TODO |
+## 9. What I would do next, in order of expected value
 
-The torch backend materialises each sequence's whole context into a fresh
-tensor every decode step, so it reads the KV cache twice per step and writes it
-once. The Triton kernel walks the block table and accumulates an online softmax
-in registers, so context KV is read exactly once. Measured speedup on decode:
-**TODO×**, growing with context length because the gather cost is O(context)
-while the kernel's advantage is a constant factor of the same term.
-
-Correctness: `pytest tests/test_paged_attention.py -k triton` — max abs
-deviation from the torch backend TODO.
-
-## 9. What I would do next
-
-- **Fused dequant-GEMM.** The obvious missing piece. Weight-only INT4 currently
-  buys memory but not compute; a Triton kernel that dequantises inside the GEMM
-  tiles would buy both.
-- **Prefix caching.** Shared system prompts are recomputed per request today.
-  The block indirection already exists; this is a content hash over blocks plus
-  a refcount.
-- **CUDA graphs for decode.** At batch 64 the per-step Python and launch
-  overhead is TODO ms of a TODO ms step. Decode shapes are static, which is
-  exactly the case graphs are for.
-- **Speculative decoding.** With a 0.5B target the draft model would have to be
-  tiny, so this matters more at 7B+.
+1. **CUDA graphs for decode.** ~1,300 launches/step at ~8 µs on a machine
+   that is 82% launch-idle. Decode shapes are static; capture once, replay.
+   This is the biggest lever on this hardware by a wide margin.
+2. **WSL2 pass.** Quantifies the WDDM tax and unlocks the Triton benchmark.
+3. **Fused dequant-GEMM** — turns §7's capacity-only result into a speed
+   result.
+4. **Prefix caching** — block tables already support it; needs content hashing
+   and refcounts.
 
 ## 10. Reproducing
 
 ```bash
 pip install -r requirements.txt
-pytest -q
-python -m bench.run_baseline --mode static --batch-sizes 1,2,4,8,16,32 --n 32
-python -m bench.sweep
+pytest                       # 92 tests, no GPU needed
+python -m bench.diagnose     # roofline + step anatomy
+python -m bench.sweep        # full sweep (--quick for ~15 min)
 python -m bench.plot
 ```
 

@@ -130,18 +130,30 @@ class BlockSpaceManager:
 
             slot = block_table[pos // block_size] * block_size
                    + pos % block_size
+
+        Walks one block at a time rather than one token at a time. Slots within
+        a block are contiguous by construction, so a whole block's worth is a
+        single range() instead of block_size separate appends. For a 2048-token
+        prefill chunk at block_size 16 that is 128 iterations instead of 2048 --
+        which matters because this runs on the critical path of every step, on
+        the CPU, on a machine where the CPU is already the bottleneck.
         """
         bs = self.block_size
         table = seq.block_table
-        slots = []
-        for pos in range(start, end):
+        slots: list[int] = []
+        pos = start
+        while pos < end:
             block_idx = pos // bs
             if block_idx >= len(table):
                 raise IndexError(
                     f"seq {seq.seq_id}: position {pos} needs block {block_idx} "
                     f"but block_table has {len(table)} entries"
                 )
-            slots.append(table[block_idx] * bs + pos % bs)
+            offset = pos % bs
+            n = min(bs - offset, end - pos)
+            base = table[block_idx] * bs + offset
+            slots.extend(range(base, base + n))
+            pos += n
         return slots
 
     # ---- reporting ------------------------------------------------------

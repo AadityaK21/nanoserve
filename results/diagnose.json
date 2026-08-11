@@ -1,0 +1,90 @@
+{
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "gpu_total_mib": 8187.5,
+  "gpu_free_mib": 7106.0,
+  "sm_mhz_idle": 210.0,
+  "sm_mhz_warm": 2595.0,
+  "watts_warm": 100.98,
+  "bandwidth_gbs": 208.89354850975724,
+  "gemm_tflops": 29.646306860435455,
+  "launch_overhead_us": 7.764480113983153,
+  "weight_mib": 942.292724609375,
+  "bandwidth_floor_ms": 4.729995459643639,
+  "rows": [
+    {
+      "impl": "transformers",
+      "batch": 1,
+      "ms": 23.68486328125,
+      "ms_run1": 23.68486328125,
+      "ms_run2": 26.771414184570315,
+      "spread_pct": 13.03174464918177,
+      "device_ops": 1350.0,
+      "gpu_busy_ms": 6.616657333333529,
+      "profiled_wall_ms": 36.39059998871138,
+      "gpu_util_pct": 18.18232547796976
+    },
+    {
+      "impl": "transformers",
+      "batch": 8,
+      "ms": 27.671545410156252,
+      "ms_run1": 28.58945007324219,
+      "ms_run2": 27.671545410156252,
+      "spread_pct": 3.317142752529608,
+      "device_ops": 1374.0,
+      "gpu_busy_ms": 9.258090333333303,
+      "profiled_wall_ms": 41.6126000151659,
+      "gpu_util_pct": 22.2482861680336
+    },
+    {
+      "impl": "transformers",
+      "batch": 32,
+      "ms": 34.59349365234375,
+      "ms_run1": 34.59349365234375,
+      "ms_run2": 38.20829772949219,
+      "spread_pct": 10.449375577605256,
+      "device_ops": 1421.6666666666667,
+      "gpu_busy_ms": 30.856929333333294,
+      "profiled_wall_ms": 36.12076669620971,
+      "gpu_util_pct": 85.42711618735167
+    },
+    {
+      "impl": "nanoserve",
+      "batch": 1,
+      "ms": 28.20789794921875,
+      "ms_run1": 31.829956054687504,
+      "ms_run2": 28.20789794921875,
+      "spread_pct": 12.840581428610385,
+      "device_ops": 1257.3333333333333,
+      "gpu_busy_ms": 7.215613999999955,
+      "profiled_wall_ms": 40.64196666392187,
+      "gpu_util_pct": 17.754096546723712
+    },
+    {
+      "impl": "nanoserve",
+      "batch": 8,
+      "ms": 29.500827026367187,
+      "ms_run1": 30.225711059570315,
+      "ms_run2": 29.500827026367187,
+      "spread_pct": 2.45716512474462,
+      "device_ops": 1281.3333333333333,
+      "gpu_busy_ms": 9.512948999999919,
+      "profiled_wall_ms": 46.34866665583104,
+      "gpu_util_pct": 20.524752245064015
+    },
+    {
+      "impl": "nanoserve",
+      "batch": 32,
+      "ms": 33.97712707519531,
+      "ms_run1": 33.97712707519531,
+      "ms_run2": 38.11105346679687,
+      "spread_pct": 12.166792037633737,
+      "device_ops": 1329.0,
+      "gpu_busy_ms": 31.044571999999974,
+      "profiled_wall_ms": 37.782499993530415,
+      "gpu_util_pct": 82.16653743218636
+    }
+  ],
+  "batch1_over_floor": 5.007375479179515
+}

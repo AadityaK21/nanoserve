@@ -43,13 +43,14 @@ class Qwen2Attention(nn.Module):
         self.v_proj = linear_cls(self.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
         self.o_proj = linear_cls(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-    def forward(self, hidden, positions, kv_cache, md: AttentionMetadata, attn_fn):
+    def forward(self, hidden, cos, sin, kv_cache, md: AttentionMetadata, attn_fn):
         T = hidden.shape[0]
         q = self.q_proj(hidden).view(T, self.num_heads, self.head_dim)
         k = self.k_proj(hidden).view(T, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden).view(T, self.num_kv_heads, self.head_dim)
 
-        q, k = self.rotary(q, k, positions)
+        # cos/sin were looked up once for the whole forward pass, not here.
+        q, k = self.rotary.apply(q, k, cos, sin)
 
         # Write before reading: a prefill chunk must attend to the keys it just
         # produced, and a decode step must attend to its own new key.
@@ -73,10 +74,10 @@ class Qwen2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
-    def forward(self, hidden, positions, kv_cache, md, attn_fn):
+    def forward(self, hidden, cos, sin, kv_cache, md, attn_fn):
         residual = hidden
         hidden = self.input_layernorm(hidden)
-        hidden = self.self_attn(hidden, positions, kv_cache, md, attn_fn)
+        hidden = self.self_attn(hidden, cos, sin, kv_cache, md, attn_fn)
         hidden = residual + hidden
 
         residual = hidden
@@ -103,8 +104,12 @@ class Qwen2Model(nn.Module):
 
     def forward(self, input_ids, positions, kv_cache, md, attn_fn):
         hidden = self.embed_tokens(input_ids)
+        # One RoPE table lookup for the whole model. The positions are the same
+        # for every layer, so doing this inside the loop would issue 48 gather
+        # kernels per step to produce 48 identical tensors.
+        cos, sin = self.rotary.cos_sin(positions, hidden.dtype)
         for layer in self.layers:
-            hidden = layer(hidden, positions, kv_cache, md, attn_fn)
+            hidden = layer(hidden, cos, sin, kv_cache, md, attn_fn)
         return self.norm(hidden)
 
 
