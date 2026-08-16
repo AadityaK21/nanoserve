@@ -26,29 +26,90 @@ Check the 4060 is visible:
 python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.is_available())"
 ```
 
-## Option B — WSL2 (needed only for the Triton kernel)
+## Option B — WSL2 (needed for the Triton kernel)
 
-Phase 2's fused attention kernel needs Triton, which is unreliable on native
-Windows. `C:\ISS` appears inside WSL as `/mnt/c/ISS`.
+The fused paged-attention kernel needs Triton, which does not support native
+Windows. Everything else runs fine without it — the engine detects Triton and
+falls back to the torch backend. `C:\ISS` appears inside WSL as `/mnt/c/ISS`,
+so there is nothing to copy.
+
+**1. Install WSL2** (PowerShell as Administrator, then reboot):
+
+```powershell
+wsl --install
+```
+
+Already have it? `wsl --update` and skip ahead. After reboot, Ubuntu opens and
+asks for a username and password — any values, it is a local account.
+
+**2. Check the GPU is visible from Linux.** Recent NVIDIA drivers expose the
+GPU to WSL automatically; there is no CUDA driver to install inside Ubuntu.
 
 ```bash
-cd /mnt/c/ISS
-python3 -m venv ~/.venvs/iss          # keep the venv on the Linux side
-source ~/.venvs/iss/bin/activate
-pip install -r requirements.txt
-pip install triton
 nvidia-smi
 ```
 
-The `/mnt/c` bridge is slow for many small files, so `pip install` and
-`git status` feel sluggish. It does not affect benchmark numbers — the hot path
-is GPU compute, not disk.
+If that fails, update your Windows NVIDIA driver rather than installing
+anything in Ubuntu.
 
-Verify the kernel matches the reference before trusting any number from it:
+**3. Environment.** Keep the venv on the Linux filesystem (`~`), not on
+`/mnt/c` — the bridge is slow for many small files. Benchmark numbers are
+unaffected either way, since the hot path is GPU compute, not disk.
 
 ```bash
-pytest tests/test_paged_attention.py -q -k triton
+sudo apt update && sudo apt install -y python3-venv python3-pip
+python3 -m venv ~/iss-venv
+source ~/iss-venv/bin/activate
+pip install torch                      # Linux PyPI torch IS the CUDA build,
+                                       # and it pulls in Triton automatically
+pip install transformers accelerate numpy matplotlib pytest
 ```
+
+**4. Reuse the model you already downloaded** instead of pulling another 1 GB:
+
+```bash
+export HF_HOME=/mnt/d/hf_cache
+echo 'export HF_HOME=/mnt/d/hf_cache' >> ~/.bashrc
+```
+
+**5. Verify Triton is there:**
+
+```bash
+cd /mnt/c/ISS
+python -c "import triton, torch; print(triton.__version__, torch.cuda.get_device_name(0))"
+```
+
+**6. Correctness before speed.** Never report a number from a kernel you have
+not validated:
+
+```bash
+python -m pytest tests/test_paged_attention.py -v -k triton
+```
+
+Six cases, checking the kernel against the torch backend on randomly permuted
+block tables and ragged sequence lengths.
+
+Use `python -m pytest`, not bare `pytest`. Ubuntu ships a system pytest on
+`PATH` that shadows the venv's, and it reads `/usr/lib/python3/dist-packages`
+instead of your virtualenv -- so it reports `No module named 'numpy'` for
+packages you just installed. If the header says `plugins: typeguard-...`, you
+are running the system one. `python -m` always uses the interpreter you
+activated.
+
+**7. Benchmark it:**
+
+```bash
+python -m bench.bench_attention     # kernel in isolation, speedup vs context
+pytest -q                           # full suite, now with Triton
+python -m bench.diagnose            # same probe as Windows -> WDDM comparison
+python -m bench.sweep --quick       # backend experiment now has both rows
+python -m bench.plot
+```
+
+`bench_attention` is the one that matters for the report: it isolates the
+attention op from the ~1300 other kernels in a step, so you can see what the
+kernel itself did, and it sweeps context length because that is the axis the
+fused kernel should win on.
 
 ## Model download
 

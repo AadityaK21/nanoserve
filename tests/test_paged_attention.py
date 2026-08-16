@@ -49,10 +49,14 @@ def build(seqs, num_blocks, block_size, Hkv, D, device="cpu", dtype=torch.float3
         nb = (sl + block_size - 1) // block_size
         table = perm[cursor:cursor + nb]
         cursor += nb
-        K = torch.randn(sl, Hkv, D, generator=g, dtype=dtype)
-        V = torch.randn(sl, Hkv, D, generator=g, dtype=dtype)
+        # Generated on CPU because `g` is a CPU generator (so the same seed
+        # gives the same data on either device), then moved. index_copy_ needs
+        # the destination, the index and the source all on one device.
+        K = torch.randn(sl, Hkv, D, generator=g, dtype=torch.float32).to(device=device, dtype=dtype)
+        V = torch.randn(sl, Hkv, D, generator=g, dtype=torch.float32).to(device=device, dtype=dtype)
         slots = torch.tensor(
-            [table[p // block_size] * block_size + p % block_size for p in range(sl)]
+            [table[p // block_size] * block_size + p % block_size for p in range(sl)],
+            dtype=torch.long, device=device,
         )
         kf.index_copy_(0, slots, K)
         vf.index_copy_(0, slots, V)
@@ -100,6 +104,7 @@ def test_prefill_matches_dense(block_size, seqs):
 
     g = torch.Generator().manual_seed(7)
     q = torch.randn(sum(seqs), Hq, D, generator=g)
+    assert q.device == cache.k_cache[0].device
     got = paged_attention_torch(q, cache.k_cache[0], cache.v_cache[0], md, 1.0 / math.sqrt(D))
 
     off = 0

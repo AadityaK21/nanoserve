@@ -161,10 +161,47 @@ def plot_backend(r):
     _save(fig, "fig6_backend.png")
 
 
+def plot_attention_kernel(_r):
+    """Microbenchmark from bench/bench_attention.py (WSL2 only)."""
+    p = RESULTS / "attention_backend.json"
+    if not p.exists():
+        return
+    d = json.loads(p.read_text())
+    rows = [x for x in d["rows"] if "speedup" in x]
+    if not rows:
+        return
+
+    batches = sorted({x["batch"] for x in rows})
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    for b in batches:
+        pts = sorted([x for x in rows if x["batch"] == b], key=lambda x: x["ctx"])
+        ctxs = [x["ctx"] for x in pts]
+        axes[0].plot(ctxs, [x["torch_ms"] for x in pts], "o--", label=f"torch b={b}")
+        axes[0].plot(ctxs, [x["triton_ms"] for x in pts], "s-", label=f"triton b={b}")
+        axes[1].plot(ctxs, [x["speedup"] for x in pts], "o-", label=f"batch {b}")
+
+    axes[0].set_xscale("log", base=2)
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("context length (tokens)")
+    axes[0].set_ylabel("attention op (ms)")
+    axes[0].set_title("Paged attention cost")
+    axes[0].grid(alpha=0.3)
+    axes[0].legend(fontsize=7)
+
+    axes[1].axhline(1.0, color="grey", ls=":")
+    axes[1].set_xscale("log", base=2)
+    axes[1].set_xlabel("context length (tokens)")
+    axes[1].set_ylabel("speedup (torch / triton)")
+    axes[1].set_title("Fused kernel vs gather + SDPA")
+    axes[1].grid(alpha=0.3)
+    axes[1].legend(fontsize=8)
+    _save(fig, "fig7_attention_kernel.png")
+
+
 def main() -> None:
     r = _load()
     for fn in (plot_throughput, plot_latency_vs_load, plot_chunked,
-               plot_block_size, plot_quant, plot_backend):
+               plot_block_size, plot_quant, plot_backend, plot_attention_kernel):
         try:
             fn(r)
         except Exception as exc:  # pragma: no cover

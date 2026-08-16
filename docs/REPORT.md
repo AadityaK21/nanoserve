@@ -39,18 +39,39 @@ concurrency headroom comes from.
 Most inference writing assumes decode is memory-bandwidth bound. On this
 machine it is not, and every result below has to be read in that light.
 
-| | measured |
-|---|---|
-| Achieved memory bandwidth | 209–222 GB/s |
-| fp16 GEMM | ~30 TFLOP/s |
-| **Bandwidth floor per decode step** | **~4.6 ms** (943 MiB / bandwidth) |
-| Actual batch-1 step | 23.7 ms (transformers) / 28.2 ms (nanoserve) |
-| GPU-busy time within that step | 6.6 / 7.2 ms |
-| **GPU utilisation during decode** | **~18%** |
+Measured on both OSes on the same laptop: Windows 11 (WDDM, torch 2.11+cu128)
+and WSL2 Ubuntu (torch 2.13+cu130).
 
-The GPU is idle ~82% of every decode step, waiting on the CPU to issue ~1,300
-kernels at ~8 µs each. Windows' WDDM driver model routes every launch through
-the OS scheduler, which inflates that latency relative to Linux.
+| | Windows | WSL2 |
+|---|---|---|
+| Achieved memory bandwidth | 209–222 GB/s | 218–226 GB/s |
+| fp16 GEMM | 29.6–31.6 TFLOP/s | 30.1–30.7 TFLOP/s |
+| Small-kernel cost | 7.8–15 µs | 6.8–9.2 µs |
+| **Bandwidth floor per decode step** | ~4.5 ms | ~4.5 ms |
+| Batch-1 step, transformers | 23.7 ms | 16.6 ms |
+| GPU-busy within that step | 6.6 ms | 6.0 ms |
+| **GPU utilisation during decode** | **18%** | **22%** |
+
+The GPU is idle ~80% of every decode step on **both** operating systems,
+waiting on the CPU to issue ~1,000–1,350 kernels.
+
+**Correcting an earlier hypothesis.** I attributed much of this to Windows'
+WDDM driver model routing launches through the OS scheduler, and predicted a
+large improvement on Linux. The measurement does not support that:
+
+- Small-kernel cost measured **6.8 µs and 9.2 µs on two consecutive runs of the
+  same Linux setup** — a 35% spread that overlaps the Windows range. The OS
+  difference is not resolvable above that noise.
+- The two OSes also ran different PyTorch builds (2.11+cu128 vs 2.13+cu130),
+  which changed device-ops-per-step from 1,350 to 1,014 for *identical*
+  transformers code. That is a library difference, not an OS one, and it
+  confounds any Windows-vs-Linux claim.
+- GPU utilisation is 18% vs 22%. Overhead-bound on both.
+
+The honest conclusion is narrower and more useful: **kernel count is the
+variable that moves decode time on this hardware; the driver model is not.**
+Every optimisation that paid (§2 optimisation table, §8's fused kernel) reduced
+op count. Nothing that changed the OS did.
 
 The signature is visible everywhere: step time is ~flat from batch 1 to batch
 32 (28 → 34 ms), so throughput scales almost linearly with batch size —
@@ -184,21 +205,91 @@ Honest summary: **quantisation here is a capacity feature, demonstrated; the
 speed feature requires a fused dequant-GEMM kernel, which is future work.**
 Claiming otherwise would not survive the first follow-up question.
 
-## 8. Attention backend
+## 8. Attention backend: fused Triton kernel vs torch gather
 
-Both rows ran the torch backend: Triton is unavailable on native Windows. The
-torch backend's known cost — re-gathering the full KV context every decode
-step — is the residual 0.6 ms/step of extra GPU work vs transformers at batch
-1 (§2). The Triton kernel (written, correctness-tested against the torch
-backend on random block tables) removes that gather by walking the block table
-with an online softmax. Benchmarking it is a WSL2 task.
+`python -m bench.bench_attention` (WSL2) → `results/attention_backend.json`,
+`fig7_attention_kernel.png`
+
+Measured on the same 4060, decode-only, Qwen2.5-0.5B shape (14 query heads /
+2 KV heads / head_dim 64, block_size 16, fp16). Correctness checked against the
+torch backend at every point before timing: **max absolute deviation ≤ 1.2e-4**
+across all cases, on randomly permuted block tables.
+
+**Speedup (torch ÷ triton):**
+
+| batch | ctx 128 | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|---|
+| 1 | **12.48×** | 12.15× | 8.10× | 4.80× | 2.06× |
+| 8 | 12.41× | 4.23× | 4.27× | 3.86× | 3.44× |
+| 32 | 4.17× | 3.75× | 3.85× | 3.71× | **4.09×** |
+
+**The shape of this table is the interesting part, and it contradicted my
+prediction.** I expected speedup to *grow* with context, since the gather the
+kernel eliminates is O(context). It shrinks — 12.5× → 2.1× at batch 1.
+
+The raw timings explain it. At batch 1 the torch path costs 0.512, 0.460,
+0.437, 0.525, 0.443 ms for contexts 128→4096: **flat across a 32× increase in
+data.** It is not gather-bound there, it is launch-bound — ten small ops
+(block-table arithmetic, two `index_select`s, permute, head expansion, SDPA)
+whose cost is dominated by launch latency, not bytes. Triton meanwhile goes
+0.041 → 0.215 ms, growing with context because it is actually doing the work.
+The ratio collapses as real work catches up with fixed overhead.
+
+At batch 32 the picture inverts: torch goes 0.689 → 19.556 ms (28× for 32×
+context), so the gather now dominates, both implementations scale together, and
+the ratio settles at the genuine traffic saving of ~4×.
+
+So the kernel wins for two different reasons in two different regimes:
+
+- **small batch/context → fewer launches** (1 kernel vs ~10 ops)
+- **large batch/context → less memory traffic** (KV read once instead of
+  written-then-read)
+
+**Where the kernel still falls short.** At batch 32 / ctx 4096 it reads 67 MiB
+of KV in 4.78 ms — about **14 GB/s**, against the ~220 GB/s this GPU sustains
+on a plain device-to-device copy. So the kernel is at roughly 6% of achievable
+bandwidth and is *not* bandwidth-bound; it is parallelism-bound. The launch
+grid is one program per (sequence, query head) = 32 × 14 = 448 programs, each
+serially walking 256 blocks. That is too few programs and too long a serial
+chain to hide memory latency. The standard fix is flash-decoding: split the
+context across programs, compute partial softmax statistics, and combine in a
+second pass. That would be the next kernel-level change, and it is worth more
+than another 4× on paper.
+
+**Effect on the whole engine** (WSL2, `bench.diagnose`, torch backend replaced
+by Triton):
+
+| | transformers | nanoserve + Triton | |
+|---|---|---|---|
+| batch 1 | 60.2 tok/s | 58.3 tok/s | 0.97× |
+| batch 8 | 377.6 tok/s | **465.7 tok/s** | **1.23×** |
+| batch 32 | 1441.3 tok/s | **1682.3 tok/s** | **1.17×** |
+| device ops / step | 1,014 | **682** | −33% |
+| GPU utilisation @ b32 | 23.2% | **35.9%** | |
+
+This is the engine's first outright win over eager transformers, and the
+mechanism is visible in the op count: the fused kernel replaced ~10 ops per
+layer with one, cutting the whole step from 1,014 to 682 device ops. Utilisation
+at batch 32 rose from 23% to 36%, which is the same statement in different
+units — less time spent issuing, more spent computing.
+
+Note the shape: parity at batch 1, widening to 1.23× at batch 8. A serving
+engine has nothing to offer a single request; its advantage is per-step fixed
+cost amortised across a full batch, and that is exactly what the curve shows.
+
+Still overhead-bound at 36% utilisation, which caps what any further kernel
+work can buy. CUDA graphs (§9) attack the remaining 64%.
 
 ## 9. What I would do next, in order of expected value
 
 1. **CUDA graphs for decode.** ~1,300 launches/step at ~8 µs on a machine
    that is 82% launch-idle. Decode shapes are static; capture once, replay.
-   This is the biggest lever on this hardware by a wide margin.
-2. **WSL2 pass.** Quantifies the WDDM tax and unlocks the Triton benchmark.
+   This is the biggest lever on this hardware by a wide margin — bigger than
+   anything in §7 or §8, because it attacks the 82% rather than the 18%.
+2. **Flash-decoding split in the Triton kernel.** §8 shows it runs at ~6% of
+   achievable bandwidth because 448 programs each walk 256 blocks serially.
+   Splitting context across programs with a second combine pass is the
+   textbook fix.
 3. **Fused dequant-GEMM** — turns §7's capacity-only result into a speed
    result.
 4. **Prefix caching** — block tables already support it; needs content hashing

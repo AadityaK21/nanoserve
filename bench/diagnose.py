@@ -404,8 +404,11 @@ def main() -> None:
             print("     because a fixed per-step cost is amortised over more sequences.")
             print("   - CUDA graphs are the highest-value next step: decode shapes are")
             print("     static, so the launches can be replayed instead of re-issued.")
-            print("   - some of this is Windows. WDDM routes every launch through the OS")
-            print("     scheduler. Re-running under WSL2 is a fair comparison to include.")
+            print()
+            print("  Before blaming the OS: measure it. The small-kernel cost above varies")
+            print("  by ~35% between runs on one machine, which is wider than the gap")
+            print("  between Windows and Linux on this hardware. Kernel *count* is the")
+            print("  variable that actually moves the step time; the driver model is not.")
 
     ns1 = next((r for r in report_rows if r["impl"] == "nanoserve" and r["batch"] == 1), None)
     if hf1 and ns1:
