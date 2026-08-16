@@ -9,6 +9,29 @@ things — the tokenizer and the raw weight tensors. The model forward pass,
 the scheduler, the cache manager, the attention kernels and the quantiser are
 all in this repo.
 
+## Results
+
+RTX 4060 Laptop 8 GB · Qwen2.5-0.5B-Instruct fp16 · lognormal prompt/output
+lengths (realistic traffic), 32 concurrent requests.
+
+| | static batching (best) | nanoserve |
+|---|---|---|
+| Output throughput | 61.0 tok/s | **100.4 tok/s** (1.65×) |
+| p99 time-to-first-token | 60.8 s | **5.2 s** (12× better) |
+| p99 end-to-end | 110.8 s | **65.4 s** |
+
+Custom Triton paged-attention kernel: **3.4–12.5×** over gather + SDPA,
+validated against the reference implementation at every measured point.
+Against eager `transformers` end-to-end: 1.23× at batch 8, with 33% fewer
+kernel launches per step.
+
+Decode on this GPU is **~80% launch-overhead bound, not memory-bandwidth
+bound** — measured with a roofline probe, not assumed. That finding is what
+drove every optimisation in the project, and it inverts the usual advice.
+
+Full analysis, including the two measurement bugs that had to be fixed before
+any of these numbers could be trusted: **[docs/REPORT.md](docs/REPORT.md)**
+
 ## Why this exists
 
 A single request through a 0.5B model is trivially fast. Serving is where the
