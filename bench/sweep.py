@@ -55,8 +55,32 @@ def make_engine(device, dtype, quantization=None, block_size=16, chunked=True,
     return LLMEngine(cfg)
 
 
+def warm_gpu(device, seconds: float = 4.0) -> None:
+    """Drag the GPU to steady-state clocks before timing anything.
+
+    This card idles at 210 MHz / 3 W and boosts to 2595 MHz / 100 W -- a 12.4x
+    swing (see report section 2). Loading a checkpoint is seconds of CPU work
+    during which the clocks fall back, so *every* experiment here needs a warm
+    up, not just the first. Omitting this is what made the original Windows
+    sweep report throughput 4-6x below what the same code does warm.
+    """
+    if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+        return
+    a = torch.randn(4096, 4096, device=device, dtype=torch.float16)
+    b = torch.randn(4096, 4096, device=device, dtype=torch.float16)
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < seconds:
+        for _ in range(20):
+            a @ b
+        torch.cuda.synchronize()
+    del a, b
+    torch.cuda.empty_cache()
+
+
 def drive(engine, reqs, request_rate=None):
     from bench.run_engine import run
+
+    warm_gpu(engine.cfg.model.device)
 
     outs, wall = run(engine, reqs, request_rate)
     s = summarize([o.metrics for o in outs], wall)
@@ -135,6 +159,7 @@ def main() -> None:
         for name, reqs in (("skewed", skewed), ("uniform", uniform)):
             out[name] = {}
             for bs in batch_sizes:
+                warm_gpu(args.device)
                 t0 = time.perf_counter()
                 recs = run_static_batched(hf_model, hf_tok, reqs, bs, device=args.device)
                 s = summarize(recs, time.perf_counter() - t0)

@@ -139,6 +139,55 @@ Static TPOT is ~100 ms at *every* batch size (§2's flat-step-time signature),
 so static throughput is `batch_size / 100 ms` — it scales only by raising batch
 size, and its latency cost scales with it.
 
+## 3b. Against vLLM
+
+`python -m bench.vllm_baseline` (WSL2, separate virtualenv) →
+`results/vllm_baseline.json`
+
+Same model, same GPU, same prompts and output lengths (identical seed through
+`nanoserve.workload`), same `gpu_memory_utilization=0.85` — vLLM defaults to
+0.90, which would hand it a larger KV cache and quietly rig the comparison.
+
+vLLM 0.27.1, `enforce_eager=False` — full torch.compile plus CUDA graph capture
+(`FULL_AND_PIECEWISE`, 51 piecewise + 35 full graphs), FlashAttention 2,
+prefix caching on. Its strongest configuration, not a handicapped one.
+
+| | output tok/s | vs vLLM |
+|---|---|---|
+| vLLM (compiled + CUDA graphs) | 2103.5 | 1.00× |
+| **nanoserve (continuous, Triton)** | **663.0** | **0.32×** |
+| static batching (best, bs=16) | 236.9 | 0.11× |
+
+A comparison against my own static baseline is a claim about my baseline, not
+about the state of the art, so this row belongs here even though it is
+unflattering. **nanoserve is 2.8× the static baseline and 0.32× vLLM.**
+
+**An independent check that fell out of this.** vLLM's memory profiler
+allocated a KV cache of **402,016 tokens** at `gpu_memory_utilization=0.85`;
+nanoserve's profiler independently computed **412,480** on the same GPU with
+the same setting — a 2.6% difference. Two implementations that share no code
+agreeing on the memory arithmetic is decent evidence that §1 is right.
+
+**Where the 3.2× goes.** §2 makes this predictable rather than mysterious:
+
+- **CUDA graphs.** Decode here is ~80% launch overhead. vLLM captures 86 graphs
+  at startup and replays them; nanoserve re-issues ~680 kernels every step
+  through the Python interpreter. This should be the single largest term, and
+  §9 lists it first for exactly this reason.
+- **Compiled scheduler and model.** vLLM's `torch.compile` pass took 10.9 s at
+  startup and fuses across the whole graph. nanoserve's scheduler is
+  interpreted Python running between every step.
+- **FlashAttention 2** vs one hand-written Triton kernel that §8 shows runs at
+  ~6% of achievable bandwidth.
+- **Prefix caching**, which nanoserve does not implement (§9 item 4). The
+  workload shares filler text across prompts, so vLLM gets some of this for
+  free — a genuine confound in vLLM's favour that a fairer run would disable.
+
+The honest read: the architecture is right and the mechanisms are the same
+ones vLLM uses; what is missing is the compilation and kernel engineering layer
+underneath. That is a much better position than being slow for reasons nobody
+can name.
+
 ## 4. Latency vs offered load (skewed, Poisson arrivals)
 
 | rate (req/s) | output tok/s | p99 TTFT | p99 TPOT | p99 E2E |
