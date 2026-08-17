@@ -4,10 +4,15 @@ An LLM inference server built from scratch: paged KV cache, continuous
 batching, a fused Triton attention kernel, weight-only INT4/INT8 quantisation,
 and a benchmark harness that reports throughput and tail latency.
 
-No vLLM, no TGI, no TensorRT-LLM. `transformers` is used for exactly two
-things — the tokenizer and the raw weight tensors. The model forward pass,
-the scheduler, the cache manager, the attention kernels and the quantiser are
-all in this repo.
+Nothing is built on vLLM, TGI or TensorRT-LLM. `transformers` is used for
+exactly two things — the tokenizer and the raw weight tensors. The model
+forward pass, the scheduler, the cache manager, the attention kernels and the
+quantiser are all in this repo.
+
+vLLM *is* installed, in a separate virtualenv, as a **measuring stick**: it
+runs the identical workload in `bench/vllm_baseline.py` so the results have an
+external reference point rather than only a self-made baseline (§3b). Nothing
+in `nanoserve/` imports it.
 
 ## Results
 
